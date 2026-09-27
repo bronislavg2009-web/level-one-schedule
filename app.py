@@ -1,21 +1,55 @@
 from flask import Flask, Response
-import csv
-import io
+import json
 import urllib.request
 import time
 from html import escape
 
 app = Flask(__name__)
 
-CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRwbM1H5sKbqfy3nv7l3sORZbwwqZMo4MHk1pjTbXZKoPio-oYYsZMpa1ix6KAfr1mED1IWsLlqaV-N/pub?gid=20260927&single=true&output=csv"
+APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxbvPRgcbaEHieHpaJDEX4ak9Z65YKI4MzZuCYG4vyhcuWsUw6UxjcWeKp1tL7Kzq8cdg/exec"
 
-_last_good_rows = None
+CACHE_SECONDS = 5
+_last_good_data = None
+_last_fetch_time = 0
 
 
-def fetch_rows():
-    global _last_good_rows
+def pretty_direction(direction):
+    direction = str(direction or "").strip()
 
-    url = CSV_URL + "&t=" + str(int(time.time()))
+    return {
+        "HH": "HIP-HOP",
+        "DH": "DANCEHALL",
+        "JF": "JAZZ FUNK",
+    }.get(direction.upper(), direction)
+
+
+def normalize_item(item):
+    if not item:
+        return None
+
+    return {
+        "time": str(item.get("time", "") or "").strip(),
+        "block": str(item.get("block", "") or "").strip(),
+        "direction": pretty_direction(item.get("direction", "")),
+        "category": str(item.get("category", "") or "").strip(),
+        "participants": str(item.get("participants", "") or "").strip(),
+        "status": str(item.get("status", "") or "").strip(),
+        "active": bool(item.get("active", False)),
+        "completed": bool(item.get("completed", False)),
+    }
+
+
+def fetch_data():
+    global _last_good_data, _last_fetch_time
+
+    now = time.time()
+
+    if _last_good_data is not None and (now - _last_fetch_time) < CACHE_SECONDS:
+        return _last_good_data
+
+    separator = "&" if "?" in APPS_SCRIPT_URL else "?"
+    url = APPS_SCRIPT_URL + separator + "t=" + str(int(now * 1000))
+
     request = urllib.request.Request(
         url,
         headers={
@@ -27,111 +61,35 @@ def fetch_rows():
 
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
-            text = response.read().decode("utf-8-sig")
+            raw = response.read().decode("utf-8-sig")
 
-        rows = list(csv.reader(io.StringIO(text)))
-        _last_good_rows = rows
-        return rows
+        data = json.loads(raw)
+
+        current = normalize_item(data.get("current"))
+        next_group = normalize_item(data.get("next"))
+
+        schedule = [
+            normalize_item(item)
+            for item in data.get("schedule", [])
+            if item
+        ]
+
+        clean_data = {
+            "updatedAt": data.get("updatedAt", ""),
+            "current": current,
+            "next": next_group,
+            "schedule": schedule,
+        }
+
+        _last_good_data = clean_data
+        _last_fetch_time = now
+
+        return clean_data
 
     except Exception:
-        if _last_good_rows is not None:
-            return _last_good_rows
+        if _last_good_data is not None:
+            return _last_good_data
         raise
-
-
-def value(row, index):
-    if index < len(row):
-        return row[index].strip()
-    return ""
-
-
-def pretty_direction(direction):
-    return {
-        "HH": "HIP-HOP",
-        "DH": "DANCEHALL",
-        "JF": "JAZZ FUNK",
-    }.get(direction.upper(), direction)
-
-
-def parse_schedule(rows):
-    header_rows = [
-        index
-        for index, row in enumerate(rows)
-        if value(row, 0) == "Время" and value(row, 1) == "Блок"
-    ]
-
-    current = None
-    schedule = []
-
-    if header_rows:
-        current_index = header_rows[0] + 1
-
-        if current_index < len(rows):
-            row = rows[current_index]
-
-            if value(row, 0) and value(row, 1):
-                current = {
-                    "time": value(row, 0),
-                    "block": value(row, 1),
-                    "direction": pretty_direction(value(row, 2)),
-                    "category": value(row, 3),
-                    "participants": value(row, 4),
-                    "status": value(row, 5),
-                }
-
-    if len(header_rows) >= 2:
-        start = header_rows[1] + 1
-
-        for row in rows[start:]:
-            if not value(row, 0) or not value(row, 1):
-                continue
-
-            schedule.append(
-                {
-                    "time": value(row, 0),
-                    "block": value(row, 1),
-                    "direction": pretty_direction(value(row, 2)),
-                    "category": value(row, 3),
-                    "participants": value(row, 4),
-                    "status": value(row, 5),
-                }
-            )
-
-    if current is None:
-        for item in schedule:
-            if item["status"] == "ГРУППА ИДЁТ":
-                current = item.copy()
-                break
-
-    next_block = None
-    current_schedule_index = None
-
-    if current:
-        for index, item in enumerate(schedule):
-            if item["time"] == current["time"] and item["block"] == current["block"]:
-                current_schedule_index = index
-                break
-
-    start_index = current_schedule_index + 1 if current_schedule_index is not None else 0
-
-    skip_blocks = {
-        "Регистрация участников",
-        "Начало LEVEL ONE",
-        "Технический перерыв",
-        "Ориентировочное окончание",
-    }
-
-    for item in schedule[start_index:]:
-        if item["status"] in {"ГРУППА ЗАВЕРШЕНА", "ГРУППА ИДЁТ"}:
-            continue
-
-        if item["block"] in skip_blocks:
-            continue
-
-        next_block = item
-        break
-
-    return current, next_block, schedule
 
 
 def render_current(current):
@@ -163,28 +121,28 @@ def render_current(current):
     """
 
 
-def render_next(next_block):
-    if not next_block:
+def render_next(next_group):
+    if not next_group:
         return """
         <div class="next">
-            <strong>Следующих этапов нет</strong>
+            <strong>Следующих групп нет</strong>
         </div>
         """
 
     details = []
 
-    if next_block["direction"]:
-        details.append(escape(next_block["direction"]))
+    if next_group["direction"]:
+        details.append(escape(next_group["direction"]))
 
-    if next_block["category"]:
-        details.append(escape(next_block["category"]))
+    if next_group["category"]:
+        details.append(escape(next_group["category"]))
 
     meta = " · ".join(details)
 
     return f"""
     <div class="next">
-        <div class="next-time">{escape(next_block["time"])}</div>
-        <strong>{escape(next_block["block"])}</strong>
+        <div class="next-time">{escape(next_group["time"])}</div>
+        <strong>{escape(next_group["block"])}</strong>
         <div class="next-meta">{meta}</div>
     </div>
     """
@@ -232,17 +190,19 @@ def home():
     error_message = ""
 
     try:
-        rows = fetch_rows()
-        current, next_block, schedule = parse_schedule(rows)
+        data = fetch_data()
+        current = data["current"]
+        next_group = data["next"]
+        schedule = data["schedule"]
 
     except Exception:
         current = None
-        next_block = None
+        next_group = None
         schedule = []
         error_message = "Не удалось получить расписание. Страница попробует снова автоматически."
 
     current_html = render_current(current)
-    next_html = render_next(next_block)
+    next_html = render_next(next_group)
     rows_html = render_schedule(schedule)
 
     page = f"""
@@ -280,7 +240,6 @@ def home():
                 --accent: #c0f840;
                 --accent-2: #d3ff4d;
                 --accent-soft: rgba(192, 248, 64, 0.10);
-                --accent-border: rgba(192, 248, 64, 0.58);
             }}
 
             * {{
